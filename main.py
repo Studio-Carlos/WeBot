@@ -27,7 +27,7 @@ from playwright.sync_api import sync_playwright
 # =============================================================================
 
 # Target URL to monitor
-TARGET_URL = "https://www.passetonbillet.fr/events/383424"
+TARGET_URL = "https://www.ticketswap.fr/festival-tickets/radio-meuh-circus-festival-2026-la-clusaz-la-clusaz-2026-04-02-CVWqcs977h1jNpTpHXNbR/thursday-tickets/5442855"
 
 # ntfy.sh topic for mobile notifications (change to your own topic)
 NTFY_TOPIC = "billet_nantes_tracy_777"
@@ -248,9 +248,9 @@ def check_for_tickets(page) -> tuple[bool, bool]:
     Check if tickets are available on the page.
     
     Logic:
-        - Page shows ticket counts like "0 Billets" for each category
-        - If ANY category shows count > 0, tickets are available
-        - Also check for "Acheter" or "Ajouter au panier" buttons
+        - Check for TicketSwap specific "X disponibles" text
+        - If count > 0, tickets are available
+        - Also check for fallback purchase buttons
     
     Args:
         page: Playwright page object
@@ -263,41 +263,41 @@ def check_for_tickets(page) -> tuple[bool, bool]:
         return (False, True)
     
     page_text = page.locator("body").inner_text()
+    lower_text = page_text.lower()
     
-    # Check for purchase buttons (strongest signal)
+    # 1. TicketSwap Specific Check: "X disponibles"
+    # Note: Scrape shows "0disponibles" or "1disponible", so regex is flexible
+    ts_match = re.search(r'(\d+)\s*disponibles?', page_text, re.IGNORECASE)
+    if ts_match:
+        count = int(ts_match.group(1))
+        if count > 0:
+            print(f"  ✅ TicketSwap: {count} ticket(s) AVAILABLE!")
+            return (True, False)
+        else:
+            print(f"  ❌ TicketSwap: {count} disponibles (Aucun billet)")
+            return (False, False)
+
+    # 2. Check for purchase buttons (fallback)
     buy_button = page.locator("text=Acheter")
     add_to_cart = page.locator("text=Ajouter au panier")
     
-    if buy_button.count() > 0:
-        print("  ✅ 'Acheter' button found!")
-        return (True, False)
+    if buy_button.count() > 0 or add_to_cart.count() > 0:
+        # Avoid false positives if "Aucun billet" is also present
+        if "aucun billet disponible" not in lower_text:
+            print("  ✅ Purchase button found!")
+            return (True, False)
     
-    if add_to_cart.count() > 0:
-        print("  ✅ 'Ajouter au panier' button found!")
-        return (True, False)
-    
-    # Check ticket counts - look for patterns like "X Billets" where X > 0
-    # The page shows "0 Billets" when no tickets, or "X Billets" with number
+    # 3. Text-based fallback "X Billets"
     ticket_pattern = re.compile(r'(\d+)\s*Billet', re.IGNORECASE)
     matches = ticket_pattern.findall(page_text)
     
     for count in matches:
         if int(count) > 0:
-            print(f"  ✅ Found {count} ticket(s) available!")
-            return (True, False)
-    
-    # Alternative: check for individual ticket entries with non-zero count
-    # Look for elements that show ticket availability
-    ticket_entries = page.locator("text=/\\d+ Billet/i")
-    for i in range(ticket_entries.count()):
-        entry_text = ticket_entries.nth(i).inner_text()
-        number_match = re.search(r'(\d+)', entry_text)
-        if number_match and int(number_match.group(1)) > 0:
-            print(f"  ✅ Ticket entry shows availability: {entry_text}")
+            print(f"  ✅ Found {count} ticket(s) matching 'Billet' pattern")
             return (True, False)
     
     # No tickets found
-    print(f"  ❌ All ticket counts are 0")
+    print(f"  ❌ No availability found")
     return (False, False)
 
 
@@ -318,6 +318,13 @@ def run_monitor() -> None:
     print(f"👁️  Headless: {HEADLESS}")
     print("="*60 + "\n")
     
+    # Send test notification at startup
+    print("🔔 Sending test notification...")
+    test_title = "Ticket Monitor Started"
+    test_message = f"Monitoring started for {TARGET_URL}"
+    send_mobile_notification(test_title, test_message)
+    send_desktop_notification(test_title, test_message)
+    print("✅ Test notification sent! Check ntfy and macOS notifications.\n")
     with sync_playwright() as p:
         # Use WebKit (Safari) instead of Chrome - much better for Cloudflare bypass!
         user_data_dir = "/Users/Carlos/Documents/Cursor/Webot/browser_profile"

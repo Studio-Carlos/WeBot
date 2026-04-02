@@ -20,13 +20,14 @@ import os
 # CONFIGURATION
 # =============================================================================
 
-TARGET_URL = "https://www.passetonbillet.fr/events/383424"
+TARGET_URL = "https://www.ticketswap.fr/festival-tickets/radio-meuh-circus-festival-2026-la-clusaz-la-clusaz-2026-04-02-CVWqcs977h1jNpTpHXNbR/thursday-tickets/5442855"
 NTFY_TOPIC = "billet_nantes_tracy_777"
 
 MIN_SLEEP = 12
-MAX_SLEEP = 20
-PAGE_LOAD_WAIT = 4
-CLOUDFLARE_WAIT = 45  # seconds to wait when Cloudflare detected
+MAX_SLEEP = 22
+PAGE_LOAD_WAIT = 5
+CLOUDFLARE_WAIT = 60  # seconds to wait when Cloudflare detected
+ERROR_NOTIFY_THRESHOLD = 3  # Send notification after this many consecutive errors
 
 SCREENSHOT_DIR = "/Users/Carlos/Documents/Cursor/Webot/screenshots"
 
@@ -70,13 +71,12 @@ def play_alert_sound():
 def send_test_notification():
     """Send a test notification at startup to verify the system works."""
     print("  📱 Sending test notification...")
-    success = send_mobile_notification(
-        "Ticket Monitor Started",
-        f"Monitoring {TARGET_URL}\nYou will be notified when tickets appear!",
-        priority="low"
-    )
+    title = "Ticket Monitor Started"
+    message = f"Monitoring TicketSwap - Radio Meuh Circus Festival\nYou will be notified when tickets appear!"
+    success = send_mobile_notification(title, message, priority="low")
+    send_desktop_notification(title, "Monitor actif! Surveillance en cours...")
     if success:
-        print("  ✅ Test notification sent! Check your phone.")
+        print("  ✅ Test notification sent! Check your phone & macOS notifications.")
     else:
         print("  ❌ Test notification FAILED - check ntfy topic")
     return success
@@ -125,33 +125,58 @@ def open_arc_background():
 def refresh_and_get_text_background() -> str:
     """
     Refresh and get page text from Arc WITHOUT activating it.
+    Uses a stealthy soft-reload and retries if the page is still loading.
     """
-    script = f'''
-    tell application "Arc"
-        tell front window
-            tell active tab
-                set tabURL to URL
-                -- Reload by executing JavaScript
-                execute javascript "location.reload()"
-                delay {PAGE_LOAD_WAIT}
-                -- Get page text
-                set pageText to execute javascript "document.body.innerText"
-                return pageText
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        # Add human-like jitter to the wait time — longer on retries
+        base_wait = PAGE_LOAD_WAIT + (attempt * 3)
+        jitter = random.uniform(0.5, 2.5)
+        wait_time = base_wait + jitter
+        
+        if attempt == 0:
+            # First attempt: soft-reload
+            js_command = "window.location.href = window.location.href"
+        else:
+            # Retry: just wait and read (page might still be loading)
+            js_command = "void(0)"
+        
+        script = f'''
+        tell application "Arc"
+            tell front window
+                tell active tab
+                    execute javascript "{js_command}"
+                    delay {wait_time:.1f}
+                    set pageText to execute javascript "document.body.innerText"
+                    return pageText
+                end tell
             end tell
         end tell
-    end tell
-    '''
+        '''
+        
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script],
+                capture_output=True,
+                text=True,
+                timeout=45
+            )
+            text = result.stdout.strip()
+            
+            # Check if we got meaningful content
+            if text and len(text) >= 100:
+                return text
+            
+            # If page is empty, retry with longer wait
+            if attempt < max_retries - 1:
+                time.sleep(2)  # Small extra wait before retry
+                
+        except:
+            if attempt < max_retries - 1:
+                time.sleep(2)
     
-    try:
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
-        return result.stdout.strip()
-    except:
-        return ""
+    return ""
 
 
 def take_screenshot() -> str:
@@ -184,7 +209,7 @@ def check_for_tickets(page_text: str) -> tuple[bool, int, str]:
     Check for tickets.
     Returns: (tickets_available, ticket_count, status_message)
     """
-    if not page_text or len(page_text.strip()) < 50:
+    if not page_text or len(page_text.strip()) < 100:
         return (False, 0, "Page empty - may still be loading")
     
     # Check for Cloudflare FIRST
@@ -192,7 +217,16 @@ def check_for_tickets(page_text: str) -> tuple[bool, int, str]:
     if "checking your browser" in lower_text or "just a moment" in lower_text or "verify you are human" in lower_text:
         return (False, 0, "CLOUDFLARE")
     
-    # Look for "X Billets" pattern
+    # 1. TicketSwap Specific Check: "X disponibles"
+    ts_match = re.search(r'(\d+)\s*disponibles?', page_text, re.IGNORECASE)
+    if ts_match:
+        count = int(ts_match.group(1))
+        if count > 0:
+            return (True, count, f"🚨 {count} TicketSwap tickets found!")
+        else:
+            return (False, 0, "0 disponibles")
+
+    # 2. Look for "X Billets" pattern (fallback)
     billets_pattern = re.compile(r'(\d+)\s*Billets?', re.IGNORECASE)
     matches = billets_pattern.findall(page_text)
     
@@ -202,15 +236,14 @@ def check_for_tickets(page_text: str) -> tuple[bool, int, str]:
             total_tickets += int(count_str)
         
         if total_tickets > 0:
-            return (True, total_tickets, f"{total_tickets} ticket(s) available!")
-        else:
-            return (False, 0, "0 tickets")
+            return (True, total_tickets, f"{total_tickets} ticket(s) (Billet pattern)!")
     
-    # Check for buy buttons
+    # 3. Check for purchase buttons (fallback)
     if "Acheter" in page_text or "Ajouter au panier" in page_text:
-        return (True, 1, "Purchase button found!")
+        if "aucun billet disponible" not in lower_text:
+            return (True, 1, "Purchase button found!")
     
-    return (False, 0, "No ticket info found")
+    return (False, 0, "No availability found")
 
 
 # =============================================================================
@@ -251,6 +284,7 @@ def run_monitor():
     print("="*60 + "\n")
     
     check_count = 0
+    consecutive_errors = 0
     
     while True:
         check_count += 1
@@ -265,24 +299,42 @@ def run_monitor():
             
             # Verbose log
             if "CLOUDFLARE" in status:
-                print(f"[{check_count}] {timestamp} | 🚫 CLOUDFLARE - waiting {CLOUDFLARE_WAIT}s for you to click...")
+                print(f"[{check_count}] {timestamp} | \U0001f6ab CLOUDFLARE - waiting {CLOUDFLARE_WAIT}s for you to click...")
+                send_mobile_notification("CLOUDFLARE DETECTED", f"Cloudflare block at {timestamp}. Manual check may be needed.", "high")
+                send_desktop_notification("CLOUDFLARE DETECTED", "Vas sur Arc et passe le Cloudflare!")
+                play_alert_sound()
+                consecutive_errors = 0
                 time.sleep(CLOUDFLARE_WAIT)
                 continue
+            elif "Page empty" in status or "No availability found" in status:
+                consecutive_errors += 1
+                print(f"[{check_count}] {timestamp} | \u26a0\ufe0f  {status} (errors: {consecutive_errors}/{ERROR_NOTIFY_THRESHOLD})")
+                if consecutive_errors >= ERROR_NOTIFY_THRESHOLD:
+                    send_mobile_notification("Monitor Warning", f"{consecutive_errors} errors in a row: {status}. Check wifi/Arc.", "default")
+                    send_desktop_notification("Monitor Warning", f"{consecutive_errors} errors - check wifi/Arc")
+                    consecutive_errors = 0  # Reset after notifying
             elif tickets_found:
-                print(f"[{check_count}] {timestamp} | 🎟️  {ticket_count} TICKETS!")
+                consecutive_errors = 0
+                print(f"[{check_count}] {timestamp} | \U0001f3ab  {ticket_count} TICKETS!")
                 take_screenshot()
                 trigger_ticket_alert(ticket_count)
                 
-                print(f"  ⏸️  Pausing 3 minutes...")
+                print(f"  \u23f8\ufe0f  Pausing 3 minutes...")
                 time.sleep(180)
-                print(f"  ▶️  Resuming...")
+                print(f"  \u25b6\ufe0f  Resuming...")
             else:
-                print(f"[{check_count}] {timestamp} | ❌ {status}")
+                consecutive_errors = 0
+                print(f"[{check_count}] {timestamp} | \u274c {status}")
             
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            print(f"[{check_count}] {timestamp} | ⚠️  Error: {e}")
+            consecutive_errors += 1
+            print(f"[{check_count}] {timestamp} | \u26a0\ufe0f  Error: {e} (errors: {consecutive_errors}/{ERROR_NOTIFY_THRESHOLD})")
+            if consecutive_errors >= ERROR_NOTIFY_THRESHOLD:
+                send_mobile_notification("Monitor Error", f"Exception: {e}", "default")
+                send_desktop_notification("Monitor Error", str(e))
+                consecutive_errors = 0
         
         sleep_time = random.uniform(MIN_SLEEP, MAX_SLEEP)
         time.sleep(sleep_time)

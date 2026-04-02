@@ -20,10 +20,10 @@ class TicketMonitorEngine:
         self.status_callback = status_callback  # For status updates (Running, Paused, Cloudflare)
         
         # Default Configuration
-        self.target_url = "https://www.passetonbillet.fr/events/383424"
+        self.target_url = "https://www.ticketswap.fr/festival-tickets/radio-meuh-circus-festival-2026-la-clusaz-la-clusaz-2026-04-02-CVWqcs977h1jNpTpHXNbR/thursday-tickets/5442855"
         self.ntfy_topic = "billet_nantes_tracy_777"
-        self.min_sleep = 12
-        self.max_sleep = 20
+        self.min_sleep = 18
+        self.max_sleep = 32
         self.page_load_wait = 4
         self.screenshot_dir = "/Users/Carlos/Documents/Cursor/Webot/screenshots"
 
@@ -45,6 +45,13 @@ class TicketMonitorEngine:
             self.thread.start()
             self.log("🚀 Monitor Engine Started")
             self.set_status("Running")
+            
+            # Send test notification at startup
+            test_title = "Webot Monitor Started"
+            test_message = f"Monitoring started for TicketSwap"
+            self.send_notification(test_title, test_message, priority="low")
+            self.send_desktop_notification(test_title, test_message)
+            self.log("🔔 Test notifications sent!")
 
     def stop(self):
         self.running = False
@@ -130,24 +137,39 @@ class TicketMonitorEngine:
         return filepath
 
     def check_for_tickets(self, text):
-        if not text or len(text) < 50:
+        if not text or len(text) < 100:
             return False, 0, "Page empty/loading"
             
         lower = text.lower()
-        if "checking your browser" in lower or "just a moment" in lower:
+        if "checking your browser" in lower or "just a moment" in lower or "verify you are human" in lower:
             return False, 0, "CLOUDFLARE"
             
-        # Regex for "X Billets"
+        # TicketSwap Specific: "X disponibles"
+        # Using a flexible regex that skips potential whitespace
+        ts_match = re.search(r'(\d+)\s*disponibles?', text, re.IGNORECASE)
+        
+        if ts_match:
+            count = int(ts_match.group(1))
+            if count > 0:
+                return True, count, f"🚨 {count} TicketSwap tickets found!"
+            else:
+                # If 0 disponibles, also double check for "Aucun billet disponible"
+                if "aucun billet disponible" in lower:
+                    return False, 0, "0 disponibles (Confirmed)"
+                return False, 0, "0 disponibles"
+
+        # General fallbacks
         matches = re.findall(r'(\d+)\s*Billets?', text, re.IGNORECASE)
         total = sum(int(m) for m in matches)
-        
         if total > 0:
             return True, total, f"{total} tickets found!"
             
         if "Acheter" in text or "Ajouter au panier" in text:
-            return True, 1, "Buy button found!"
+            # Only trigger if NOT followed by "Vendu" or similar indicators
+            if "aucun billet disponible" not in lower:
+                return True, 1, "Buy button detected!"
             
-        return False, 0, "No tickets"
+        return False, 0, "No tickets found"
 
     def _run_loop(self):
         self.open_arc_background()
