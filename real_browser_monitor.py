@@ -125,58 +125,69 @@ def open_arc_background():
 def refresh_and_get_text_background() -> str:
     """
     Refresh and get page text from Arc WITHOUT activating it.
-    Uses a stealthy soft-reload and retries if the page is still loading.
+    Uses native Cmd+R (like a real user) instead of JS reload.
     """
-    max_retries = 3
+    jitter = random.uniform(0.5, 1.5)
+    wait_time = PAGE_LOAD_WAIT + jitter
     
-    for attempt in range(max_retries):
-        # Add human-like jitter to the wait time — longer on retries
-        base_wait = PAGE_LOAD_WAIT + (attempt * 3)
-        jitter = random.uniform(0.5, 2.5)
-        wait_time = base_wait + jitter
-        
-        if attempt == 0:
-            # First attempt: soft-reload
-            js_command = "window.location.href = window.location.href"
-        else:
-            # Retry: just wait and read (page might still be loading)
-            js_command = "void(0)"
-        
-        script = f'''
-        tell application "Arc"
-            tell front window
-                tell active tab
-                    execute javascript "{js_command}"
-                    delay {wait_time:.1f}
-                    set pageText to execute javascript "document.body.innerText"
-                    return pageText
-                end tell
+    # Use Cmd+R keystroke — identical to a human pressing refresh
+    # This is undetectable by TicketSwap's anti-bot
+    script = f'''
+    tell application "Arc"
+        tell front window
+            tell active tab
+                reload
             end tell
         end tell
-        '''
-        
-        try:
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True,
-                text=True,
-                timeout=45
-            )
-            text = result.stdout.strip()
-            
-            # Check if we got meaningful content
-            if text and len(text) >= 100:
-                return text
-            
-            # If page is empty, retry with longer wait
-            if attempt < max_retries - 1:
-                time.sleep(2)  # Small extra wait before retry
-                
-        except:
-            if attempt < max_retries - 1:
-                time.sleep(2)
+    end tell
+    delay {wait_time:.1f}
+    tell application "Arc"
+        tell front window
+            tell active tab
+                set pageText to execute javascript "document.body.innerText"
+                return pageText
+            end tell
+        end tell
+    end tell
+    '''
     
-    return ""
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        text = result.stdout.strip()
+        
+        if text and len(text) >= 100:
+            return text
+    except:
+        pass
+    
+    # Step 2: Page wasn't ready — just wait more and re-read (no reload)
+    re_read_script = '''
+    tell application "Arc"
+        tell front window
+            tell active tab
+                delay 4
+                set pageText to execute javascript "document.body.innerText"
+                return pageText
+            end tell
+        end tell
+    end tell
+    '''
+    
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", re_read_script],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        return result.stdout.strip()
+    except:
+        return ""
 
 
 def take_screenshot() -> str:
@@ -212,10 +223,23 @@ def check_for_tickets(page_text: str) -> tuple[bool, int, str]:
     if not page_text or len(page_text.strip()) < 100:
         return (False, 0, "Page empty - may still be loading")
     
-    # Check for Cloudflare FIRST
     lower_text = page_text.lower()
+    
+    # Check for Cloudflare FIRST
     if "checking your browser" in lower_text or "just a moment" in lower_text or "verify you are human" in lower_text:
         return (False, 0, "CLOUDFLARE")
+    
+    # Check for TicketSwap error/flag messages BEFORE checking tickets
+    ticketswap_errors = [
+        "un problème est survenu",
+        "une erreur est survenue",
+        "contacte-nous s'il se reproduit",
+        "something went wrong",
+        "an error occurred",
+    ]
+    for error_msg in ticketswap_errors:
+        if error_msg in lower_text:
+            return (False, 0, f"FLAGGED: {error_msg}")
     
     # 1. TicketSwap Specific Check: "X disponibles"
     ts_match = re.search(r'(\d+)\s*disponibles?', page_text, re.IGNORECASE)
@@ -305,6 +329,14 @@ def run_monitor():
                 play_alert_sound()
                 consecutive_errors = 0
                 time.sleep(CLOUDFLARE_WAIT)
+                continue
+            elif "FLAGGED" in status:
+                print(f"[{check_count}] {timestamp} | \U0001f6a9 {status}")
+                send_mobile_notification("TicketSwap FLAGGED!", f"{status} at {timestamp}. Page may need manual refresh.", "high")
+                send_desktop_notification("TicketSwap FLAGGED!", status)
+                play_alert_sound()
+                print(f"  \u23f8\ufe0f  Cooling down 2 minutes...")
+                time.sleep(120)
                 continue
             elif "Page empty" in status or "No availability found" in status:
                 consecutive_errors += 1
